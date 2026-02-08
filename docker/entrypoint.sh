@@ -37,8 +37,9 @@ if [ -n "${TELEGRAM_ALLOW_FROM}" ]; then
   echo "Applying TELEGRAM_ALLOW_FROM from environment..."
   TMP=$(mktemp)
   # Convert comma-separated IDs to JSON array: "id1,id2" -> ["id1","id2"]
-  ALLOW_JSON=$(echo "${TELEGRAM_ALLOW_FROM}" | sed 's/,/","/g' | sed 's/^/["/' | sed 's/$/"]/')
+  ALLOW_JSON=$(echo "${TELEGRAM_ALLOW_FROM}" | sed 's/,/","/g' | sed 's/^/["/' | sed 's/$/"]/') 
   cat "${PICOBOT_HOME}/config.json" | \
+    sed "s/\"allowFrom\": null/\"allowFrom\": ${ALLOW_JSON}/g" | \
     sed "s/\"allowFrom\": \[\]/\"allowFrom\": ${ALLOW_JSON}/g" > "$TMP" && \
     mv "$TMP" "${PICOBOT_HOME}/config.json"
 fi

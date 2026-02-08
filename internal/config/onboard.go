@@ -21,7 +21,7 @@ func DefaultConfig() Config {
 			MaxToolIterations:  100,
 			HeartbeatIntervalS: 60,
 		}},
-		Channels: ChannelsConfig{Telegram: TelegramConfig{Enabled: false, Token: ""}},
+		Channels: ChannelsConfig{Telegram: TelegramConfig{Enabled: false, Token: "", AllowFrom: []string{}}},
 		Providers: ProvidersConfig{
 			OpenRouter: &ProviderConfig{APIKey: "sk-or-v1-REPLACE_ME", APIBase: "https://openrouter.ai/api/v1"},
 		},
