@@ -47,7 +47,7 @@ func TestStartTelegramWithBase(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := StartTelegramWithBase(ctx, b, token, base); err != nil {
+	if err := StartTelegramWithBase(ctx, b, token, base, nil); err != nil {
 		t.Fatalf("StartTelegramWithBase failed: %v", err)
 	}
 

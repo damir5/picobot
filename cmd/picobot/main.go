@@ -147,7 +147,7 @@ func NewRootCmd() *cobra.Command {
 
 			// start telegram if enabled
 			if cfg.Channels.Telegram.Enabled {
-				if err := channels.StartTelegram(ctx, bus, cfg.Channels.Telegram.Token); err != nil {
+				if err := channels.StartTelegram(ctx, bus, cfg.Channels.Telegram.Token, cfg.Channels.Telegram.AllowFrom); err != nil {
 					fmt.Fprintf(os.Stderr, "failed to start telegram: %v\n", err)
 				}
 			}

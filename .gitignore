@@ -10,13 +10,13 @@
 docker/.env
 
 # Session data
-sessions/
-internal/agent/sessions/
+/sessions/
+/internal/agent/sessions/
 
 # Memory data
 /memory/
-internal/agent/memory/memory
-internal/agent/memory/*.md
+/internal/agent/memory/memory
+/internal/agent/memory/*.md
 
 # Runtime data
 picobot-data/
@@ -31,3 +31,7 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# Misc
+*.log
+*.psd
