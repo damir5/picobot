@@ -116,7 +116,9 @@ func NewRootCmd() *cobra.Command {
 			}
 
 			// create scheduler with fire callback that routes back through the agent loop, so the LLM can process the reminder and respond naturally to the user.
-			scheduler := cron.NewScheduler(func(job cron.Job) {
+			// Use persistence to survive restarts.
+			persistPath := filepath.Join(cfg.Agents.Defaults.Workspace, "cron_jobs.json")
+			scheduler := cron.NewSchedulerWithPersistence(func(job cron.Job) {
 				log.Printf("cron fired: %s — %s", job.Name, job.Message)
 				hub.In <- chat.Inbound{
 					Channel:  job.Channel,
@@ -124,7 +126,7 @@ func NewRootCmd() *cobra.Command {
 					ChatID:   job.ChatID,
 					Content:  fmt.Sprintf("[Scheduled reminder fired] %s — Please relay this to the user in a friendly way.", job.Message),
 				}
-			})
+			}, persistPath)
 
 			ag := agent.NewAgentLoop(hub, provider, model, 20, cfg.Agents.Defaults.Workspace, scheduler)
 			ctx, cancel := context.WithCancel(context.Background())
