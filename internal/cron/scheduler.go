@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	cronlib "github.com/robfig/cron/v3"
 )
 
 // Job represents a scheduled task.
@@ -22,6 +24,7 @@ type Job struct {
 	ChatID    string // originating chat ID
 	Recurring bool   // if true, re-schedule after firing
 	Interval  time.Duration
+	CronExpr  string // if set, use cron expression for scheduling instead of fixed interval
 	fired     bool
 }
 
@@ -35,6 +38,7 @@ type persistedJob struct {
 	ChatID    string `json:"chatID"`
 	Recurring bool   `json:"recurring,omitempty"`
 	IntervalS string `json:"interval,omitempty"` // Go duration string
+	CronExpr  string `json:"cronExpr,omitempty"`
 }
 
 // FireCallback is called when a job fires. The scheduler passes the job details.
@@ -117,6 +121,34 @@ func (s *Scheduler) AddRecurring(name, message string, interval time.Duration, c
 	return id
 }
 
+// cronParser is a standard 5-field cron parser (minute hour dom month dow).
+var cronParser = cronlib.NewParser(cronlib.Minute | cronlib.Hour | cronlib.Dom | cronlib.Month | cronlib.Dow)
+
+// AddCron schedules a job using a cron expression. Returns the job ID.
+func (s *Scheduler) AddCron(name, message, expr, channel, chatID string) (string, error) {
+	sched, err := cronParser.Parse(expr)
+	if err != nil {
+		return "", fmt.Errorf("invalid cron expression %q: %v", expr, err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nextID++
+	id := fmt.Sprintf("job-%d", s.nextID)
+	s.jobs[id] = &Job{
+		ID:        id,
+		Name:      name,
+		Message:   message,
+		FireAt:    sched.Next(time.Now()),
+		Channel:   channel,
+		ChatID:    chatID,
+		Recurring: true,
+		CronExpr:  expr,
+	}
+	log.Printf("cron: scheduled cron job %q (%s) expr=%s next=%v", name, id, expr, s.jobs[id].FireAt)
+	s.saveLocked()
+	return id, nil
+}
+
 // Cancel removes a job by ID. Returns true if found.
 func (s *Scheduler) Cancel(id string) bool {
 	s.mu.Lock()
@@ -188,7 +220,16 @@ func (s *Scheduler) tick(now time.Time) {
 	// handle fired jobs while still holding lock
 	needSave := len(toFire) > 0
 	for _, j := range toFire {
-		if j.Recurring {
+		if j.CronExpr != "" {
+			// Reschedule using cron expression
+			sched, err := cronParser.Parse(j.CronExpr)
+			if err == nil {
+				j.FireAt = sched.Next(now)
+			} else {
+				log.Printf("cron: failed to reparse cron expr for job %q: %v", j.Name, err)
+				delete(s.jobs, j.ID)
+			}
+		} else if j.Recurring {
 			j.FireAt = now.Add(j.Interval)
 		} else {
 			j.fired = true
@@ -225,6 +266,7 @@ func (s *Scheduler) saveLocked() {
 			ChatID:    j.ChatID,
 			Recurring: j.Recurring,
 			IntervalS: j.Interval.String(),
+			CronExpr:  j.CronExpr,
 		})
 	}
 	data, err := json.MarshalIndent(pjobs, "", "  ")
@@ -270,12 +312,22 @@ func (s *Scheduler) load() error {
 		}
 		interval, _ := time.ParseDuration(pj.IntervalS)
 		// Skip expired one-shot jobs
-		if !pj.Recurring && now.After(fireAt) {
+		if !pj.Recurring && pj.CronExpr == "" && now.After(fireAt) {
 			log.Printf("cron: skipping expired one-shot job %q", pj.Name)
 			continue
 		}
-		// For recurring jobs, advance past missed fire times
-		if pj.Recurring && interval > 0 {
+		// For cron jobs, compute next fire time from expression
+		if pj.CronExpr != "" {
+			sched, err := cronParser.Parse(pj.CronExpr)
+			if err != nil {
+				log.Printf("cron: skipping job %q with invalid cron expr: %v", pj.Name, err)
+				continue
+			}
+			if now.After(fireAt) {
+				fireAt = sched.Next(now)
+			}
+		} else if pj.Recurring && interval > 0 {
+			// For recurring jobs, advance past missed fire times
 			for now.After(fireAt) {
 				fireAt = fireAt.Add(interval)
 			}
@@ -294,6 +346,7 @@ func (s *Scheduler) load() error {
 			ChatID:    pj.ChatID,
 			Recurring: pj.Recurring,
 			Interval:  interval,
+			CronExpr:  pj.CronExpr,
 		}
 	}
 	return nil
