@@ -83,7 +83,12 @@ func NewRootCmd() *cobra.Command {
 				model = provider.GetDefaultModel()
 			}
 
-			ag := agent.NewAgentLoop(hub, provider, model, 5, cfg.Agents.Defaults.Workspace, nil)
+			// Create scheduler with persistence so agent can manage cron jobs.
+			// Nil callback is fine — jobs fire when the gateway runs.
+			persistPath := filepath.Join(cfg.Agents.Defaults.Workspace, "cron_jobs.yaml")
+			scheduler := cron.NewSchedulerWithPersistence(nil, persistPath)
+
+			ag := agent.NewAgentLoop(hub, provider, model, 5, cfg.Agents.Defaults.Workspace, scheduler)
 
 			resp, err := ag.ProcessDirect(msg, 60*time.Second)
 			if err != nil {
@@ -117,7 +122,7 @@ func NewRootCmd() *cobra.Command {
 
 			// create scheduler with fire callback that routes back through the agent loop, so the LLM can process the reminder and respond naturally to the user.
 			// Use persistence to survive restarts.
-			persistPath := filepath.Join(cfg.Agents.Defaults.Workspace, "cron_jobs.json")
+			persistPath := filepath.Join(cfg.Agents.Defaults.Workspace, "cron_jobs.yaml")
 			scheduler := cron.NewSchedulerWithPersistence(func(job cron.Job) {
 				log.Printf("cron fired: %s — %s", job.Name, job.Message)
 				hub.In <- chat.Inbound{
@@ -162,6 +167,49 @@ func NewRootCmd() *cobra.Command {
 	}
 	gatewayCmd.Flags().StringP("model", "M", "", "Model to use (overrides config/provider default)")
 	rootCmd.AddCommand(gatewayCmd)
+
+	tickCmd := &cobra.Command{
+		Use:   "tick",
+		Short: "Process due cron jobs once and exit",
+		Run: func(cmd *cobra.Command, args []string) {
+			cfg, _ := config.LoadConfig()
+			provider := providers.NewProviderFromConfig(cfg)
+
+			modelFlag, _ := cmd.Flags().GetString("model")
+			model := modelFlag
+			if model == "" && cfg.Agents.Defaults.Model != "" {
+				model = cfg.Agents.Defaults.Model
+			}
+			if model == "" {
+				model = provider.GetDefaultModel()
+			}
+
+			persistPath := filepath.Join(cfg.Agents.Defaults.Workspace, "cron_jobs.yaml")
+			scheduler := cron.NewSchedulerWithPersistence(nil, persistPath)
+
+			due := scheduler.TickOnce(time.Now())
+			if len(due) == 0 {
+				fmt.Println("No due jobs.")
+				return
+			}
+
+			hub := chat.NewHub(100)
+			ag := agent.NewAgentLoop(hub, provider, model, 20, cfg.Agents.Defaults.Workspace, scheduler)
+
+			for _, job := range due {
+				log.Printf("tick: processing job %q: %s", job.Name, job.Message)
+				prompt := fmt.Sprintf("[Scheduled reminder fired] %s — Please relay this to the user in a friendly way.", job.Message)
+				resp, err := ag.ProcessDirect(prompt, 60*time.Second)
+				if err != nil {
+					log.Printf("tick: error processing job %q: %v", job.Name, err)
+					continue
+				}
+				fmt.Printf("[%s] %s\n", job.Name, resp)
+			}
+		},
+	}
+	tickCmd.Flags().StringP("model", "M", "", "Model to use (overrides config/provider default)")
+	rootCmd.AddCommand(tickCmd)
 
 	// memory subcommands: read, append, write, recent
 	memoryCmd := &cobra.Command{

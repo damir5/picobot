@@ -1,13 +1,13 @@
 package config
 
 import (
-	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 
 	"github.com/local/picobot/embeds"
+	"gopkg.in/yaml.v3"
 )
 
 // DefaultConfig returns a minimal default Config with sensible defaults.
@@ -28,12 +28,12 @@ func DefaultConfig() Config {
 	}
 }
 
-// SaveConfig writes the config to the given path (creating parent dirs).
+// SaveConfig writes the config to the given path as YAML (creating parent dirs).
 func SaveConfig(cfg Config, path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	b, err := json.MarshalIndent(cfg, "", "  ")
+	b, err := yaml.Marshal(cfg)
 	if err != nil {
 		return err
 	}
@@ -316,7 +316,7 @@ func ResolveDefaultPaths() (cfgPath string, workspacePath string, err error) {
 	if err != nil {
 		return "", "", err
 	}
-	cfgPath = filepath.Join(home, ".picobot", "config.json")
+	cfgPath = filepath.Join(home, ".picobot", "config.yaml")
 	workspacePath = filepath.Join(home, ".picobot", "workspace")
 	return cfgPath, workspacePath, nil
 }

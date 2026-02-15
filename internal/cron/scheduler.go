@@ -1,7 +1,6 @@
 package cron
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -9,9 +8,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	cronlib "github.com/robfig/cron/v3"
+	"gopkg.in/yaml.v3"
 )
 
 // Job represents a scheduled task.
@@ -28,17 +29,17 @@ type Job struct {
 	fired     bool
 }
 
-// persistedJob is the JSON-serializable form of Job.
+// persistedJob is the YAML-serializable form of Job.
 type persistedJob struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Message   string `json:"message"`
-	FireAt    string `json:"fireAt"`
-	Channel   string `json:"channel"`
-	ChatID    string `json:"chatID"`
-	Recurring bool   `json:"recurring,omitempty"`
-	IntervalS string `json:"interval,omitempty"` // Go duration string
-	CronExpr  string `json:"cronExpr,omitempty"`
+	ID        string `yaml:"id"`
+	Name      string `yaml:"name"`
+	Message   string `yaml:"message"`
+	FireAt    string `yaml:"fireAt"`
+	Channel   string `yaml:"channel"`
+	ChatID    string `yaml:"chatID"`
+	Recurring bool   `yaml:"recurring,omitempty"`
+	IntervalS string `yaml:"interval,omitempty"` // Go duration string
+	CronExpr  string `yaml:"cronExpr,omitempty"`
 }
 
 // FireCallback is called when a job fires. The scheduler passes the job details.
@@ -63,7 +64,7 @@ func NewScheduler(callback FireCallback) *Scheduler {
 	}
 }
 
-// NewSchedulerWithPersistence creates a scheduler that saves/loads jobs to a JSON file.
+// NewSchedulerWithPersistence creates a scheduler that saves/loads jobs to a YAML file.
 func NewSchedulerWithPersistence(callback FireCallback, path string) *Scheduler {
 	s := &Scheduler{
 		jobs:        make(map[string]*Job),
@@ -207,6 +208,49 @@ func (s *Scheduler) Start(done <-chan struct{}) {
 	}
 }
 
+// TickOnce checks for due jobs at the given time, updates persistence, and returns them.
+// Unlike Start/tick, it does not call the fire callback — the caller is responsible for processing.
+func (s *Scheduler) TickOnce(now time.Time) []Job {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var due []Job
+	for _, j := range s.jobs {
+		if !j.fired && now.After(j.FireAt) {
+			due = append(due, *j)
+		}
+	}
+
+	if len(due) == 0 {
+		return nil
+	}
+
+	// Update state for fired jobs
+	for _, dj := range due {
+		j := s.jobs[dj.ID]
+		if j == nil {
+			continue
+		}
+		if j.CronExpr != "" {
+			sched, err := cronParser.Parse(j.CronExpr)
+			if err == nil {
+				j.FireAt = sched.Next(now)
+			} else {
+				log.Printf("cron: failed to reparse cron expr for job %q: %v", j.Name, err)
+				delete(s.jobs, j.ID)
+			}
+		} else if j.Recurring {
+			j.FireAt = now.Add(j.Interval)
+		} else {
+			j.fired = true
+			delete(s.jobs, j.ID)
+		}
+	}
+
+	s.saveLocked()
+	return due
+}
+
 // tick checks all jobs and fires any that are due.
 func (s *Scheduler) tick(now time.Time) {
 	s.mu.Lock()
@@ -250,6 +294,29 @@ func (s *Scheduler) tick(now time.Time) {
 	}
 }
 
+// withFileLock acquires an exclusive flock on the persist file, calls fn, then unlocks.
+// If persistPath is empty, fn is called directly.
+func (s *Scheduler) withFileLock(fn func() error) error {
+	if s.persistPath == "" {
+		return fn()
+	}
+	dir := filepath.Dir(s.persistPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	lockPath := s.persistPath + ".lock"
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return fmt.Errorf("cron: open lock file: %w", err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("cron: flock: %w", err)
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	return fn()
+}
+
 // saveLocked persists jobs to disk. Caller must hold s.mu.
 func (s *Scheduler) saveLocked() {
 	if s.persistPath == "" {
@@ -269,17 +336,15 @@ func (s *Scheduler) saveLocked() {
 			CronExpr:  j.CronExpr,
 		})
 	}
-	data, err := json.MarshalIndent(pjobs, "", "  ")
+
+	err := s.withFileLock(func() error {
+		data, err := yaml.Marshal(pjobs)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(s.persistPath, data, 0644)
+	})
 	if err != nil {
-		log.Printf("cron: failed to marshal jobs: %v", err)
-		return
-	}
-	dir := filepath.Dir(s.persistPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		log.Printf("cron: failed to create directory %s: %v", dir, err)
-		return
-	}
-	if err := os.WriteFile(s.persistPath, data, 0644); err != nil {
 		log.Printf("cron: failed to save jobs to %s: %v", s.persistPath, err)
 	}
 }
@@ -289,7 +354,12 @@ func (s *Scheduler) load() error {
 	if s.persistPath == "" {
 		return nil
 	}
-	data, err := os.ReadFile(s.persistPath)
+	var data []byte
+	err := s.withFileLock(func() error {
+		var readErr error
+		data, readErr = os.ReadFile(s.persistPath)
+		return readErr
+	})
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil // no file yet, that's fine
@@ -300,7 +370,7 @@ func (s *Scheduler) load() error {
 		return nil
 	}
 	var pjobs []persistedJob
-	if err := json.Unmarshal(data, &pjobs); err != nil {
+	if err := yaml.Unmarshal(data, &pjobs); err != nil {
 		return err
 	}
 	now := time.Now()

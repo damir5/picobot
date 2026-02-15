@@ -1,27 +1,26 @@
 package config
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
+
+	"gopkg.in/yaml.v3"
 )
 
-// LoadConfig loads config from ~/.picobot/config.json if present, otherwise returns defaults.
+// LoadConfig loads config from ~/.picobot/config.yaml if present, otherwise returns defaults.
 func LoadConfig() (Config, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		home = "."
 	}
-	path := filepath.Join(home, ".picobot", "config.json")
+	path := filepath.Join(home, ".picobot", "config.yaml")
 	var cfg Config
-	f, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		// return empty config (not an error)
 		return Config{}, nil
 	}
-	defer f.Close()
-	dec := json.NewDecoder(f)
-	if err := dec.Decode(&cfg); err != nil {
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil

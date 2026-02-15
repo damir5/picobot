@@ -58,9 +58,7 @@ func NewAgentLoop(b *chat.Hub, provider providers.LLMProvider, model string, max
 	reg.Register(tools.NewExecTool(60))
 	reg.Register(tools.NewWebTool())
 	reg.Register(tools.NewSpawnTool())
-	if scheduler != nil {
-		reg.Register(tools.NewCronTool(scheduler, provider, model))
-	}
+	reg.Register(tools.NewCronTool(scheduler, provider, model))
 
 	sm := session.NewSessionManager(workspace)
 	ctx := NewContextBuilder(workspace, memory.NewLLMRanker(provider, model), 5)

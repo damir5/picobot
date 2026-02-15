@@ -1,12 +1,13 @@
 package cron
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestSchedulerFiresJob(t *testing.T) {
@@ -172,7 +173,7 @@ func TestCronJobReschedulesAfterFiring(t *testing.T) {
 
 func TestCronJobPersistenceRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "jobs.json")
+	path := filepath.Join(dir, "jobs.yaml")
 
 	s := NewScheduler(nil)
 	s.persistPath = path
@@ -189,7 +190,7 @@ func TestCronJobPersistenceRoundTrip(t *testing.T) {
 	}
 
 	var pjobs []persistedJob
-	if err := json.Unmarshal(data, &pjobs); err != nil {
+	if err := yaml.Unmarshal(data, &pjobs); err != nil {
 		t.Fatalf("failed to unmarshal: %v", err)
 	}
 	if len(pjobs) != 1 {
@@ -210,5 +211,54 @@ func TestCronJobPersistenceRoundTrip(t *testing.T) {
 	}
 	if jobs[0].Name != "nightly" {
 		t.Errorf("expected loaded name 'nightly', got %q", jobs[0].Name)
+	}
+}
+
+func TestTickOnce(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "jobs.yaml")
+
+	s := NewSchedulerWithPersistence(nil, path)
+	s.Add("overdue", "do it now", 0, "cli", "direct")
+
+	// TickOnce should return the overdue job
+	now := time.Now().Add(1 * time.Second)
+	due := s.TickOnce(now)
+	if len(due) != 1 {
+		t.Fatalf("expected 1 due job, got %d", len(due))
+	}
+	if due[0].Name != "overdue" {
+		t.Errorf("expected name 'overdue', got %q", due[0].Name)
+	}
+
+	// One-shot job should be removed after TickOnce
+	if len(s.List()) != 0 {
+		t.Error("expected 0 jobs after one-shot TickOnce")
+	}
+}
+
+func TestTickOnceRecurringReschedules(t *testing.T) {
+	s := NewScheduler(nil)
+	s.AddRecurring("repeat", "again", 5*time.Minute, "cli", "direct")
+
+	// Make it overdue
+	s.mu.Lock()
+	for _, j := range s.jobs {
+		j.FireAt = time.Now().Add(-1 * time.Second)
+	}
+	s.mu.Unlock()
+
+	due := s.TickOnce(time.Now())
+	if len(due) != 1 {
+		t.Fatalf("expected 1 due job, got %d", len(due))
+	}
+
+	// Recurring job should still exist with future FireAt
+	jobs := s.List()
+	if len(jobs) != 1 {
+		t.Fatalf("expected recurring job to persist, got %d", len(jobs))
+	}
+	if time.Until(jobs[0].FireAt) <= 0 {
+		t.Error("expected rescheduled FireAt to be in the future")
 	}
 }

@@ -1,10 +1,11 @@
 package config
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestInitializeWorkspaceCreatesFiles(t *testing.T) {
@@ -44,7 +45,7 @@ func TestSaveAndLoadConfig(t *testing.T) {
 	d := t.TempDir()
 	cfg := DefaultConfig()
 	cfg.Agents.Defaults.Workspace = d
-	path := filepath.Join(d, "config.json")
+	path := filepath.Join(d, "config.yaml")
 	if err := SaveConfig(cfg, path); err != nil {
 		t.Fatalf("SaveConfig failed: %v", err)
 	}
@@ -54,8 +55,8 @@ func TestSaveAndLoadConfig(t *testing.T) {
 		t.Fatalf("reading saved config failed: %v", err)
 	}
 	var parsed Config
-	if err := json.Unmarshal(b, &parsed); err != nil {
-		t.Fatalf("invalid json: %v", err)
+	if err := yaml.Unmarshal(b, &parsed); err != nil {
+		t.Fatalf("invalid yaml: %v", err)
 	}
 	if parsed.Agents.Defaults.Workspace != d {
 		t.Fatalf("workspace mismatch: got %s want %s", parsed.Agents.Defaults.Workspace, d)
