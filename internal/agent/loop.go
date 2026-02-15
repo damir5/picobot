@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"regexp"
@@ -144,10 +145,11 @@ func (a *AgentLoop) Run(ctx context.Context) {
 			toolDefs := a.tools.Definitions()
 			for iteration < a.maxIterations {
 				iteration++
+				log.Printf("agent: iteration %d/%d model=%s messages=%d tools=%d", iteration, a.maxIterations, a.model, len(messages), len(toolDefs))
 				resp, err := a.provider.Chat(ctx, messages, toolDefs, a.model)
 				if err != nil {
-					log.Printf("provider error: %v", err)
-					finalContent = "Sorry, I encountered an error while processing your request."
+					log.Printf("provider error on iteration %d: %v", iteration, err)
+					finalContent = fmt.Sprintf("Error processing request (attempt %d): %v", iteration, err)
 					break
 				}
 
@@ -207,11 +209,14 @@ func (a *AgentLoop) ProcessDirect(content string, timeout time.Duration) (string
 	messages := a.context.BuildMessages(nil, content, "cli", "direct", memCtx, memories)
 
 	// Support tool calling iterations (similar to main loop)
+	toolDefs := a.tools.Definitions()
 	var lastToolResult string
 	for iteration := 0; iteration < a.maxIterations; iteration++ {
-		resp, err := a.provider.Chat(ctx, messages, a.tools.Definitions(), a.model)
+		log.Printf("direct: iteration %d/%d model=%s messages=%d tools=%d", iteration+1, a.maxIterations, a.model, len(messages), len(toolDefs))
+		resp, err := a.provider.Chat(ctx, messages, toolDefs, a.model)
 		if err != nil {
-			return "", err
+			log.Printf("direct: provider error on iteration %d: %v", iteration+1, err)
+			return "", fmt.Errorf("provider error (iteration %d/%d): %w", iteration+1, a.maxIterations, err)
 		}
 
 		if !resp.HasToolCalls {
