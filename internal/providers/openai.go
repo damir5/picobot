@@ -14,20 +14,28 @@ import (
 
 // OpenAIProvider calls an OpenAI-compatible API (OpenAI, OpenRouter, or similar).
 type OpenAIProvider struct {
-	APIKey  string
-	APIBase string // e.g. https://api.openai.com/v1 or https://openrouter.ai/api/v1
-	Client  *http.Client
+	APIKey     string
+	APIBase    string // e.g. https://api.openai.com/v1 or https://openrouter.ai/api/v1
+	Client     *http.Client
+	MaxRetries int
 }
 
-func NewOpenAIProvider(apiKey, apiBase string) *OpenAIProvider {
+func NewOpenAIProvider(apiKey, apiBase string, timeout time.Duration, maxRetries int) *OpenAIProvider {
 	if apiBase == "" {
 		apiBase = "https://api.openai.com/v1" // sensible default; can be overridden
 	}
+	if timeout <= 0 {
+		timeout = 120 * time.Second
+	}
+	if maxRetries <= 0 {
+		maxRetries = 5
+	}
 	return &OpenAIProvider{
-		APIKey:  apiKey,
-		APIBase: strings.TrimRight(apiBase, "/"),
+		APIKey:     apiKey,
+		APIBase:    strings.TrimRight(apiBase, "/"),
+		MaxRetries: maxRetries,
 		Client: &http.Client{
-			Timeout: 60 * time.Second,
+			Timeout: timeout,
 		},
 	}
 }
@@ -135,29 +143,65 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []Message, tools []T
 	}
 
 	url := fmt.Sprintf("%s/chat/completions", p.APIBase)
-	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(string(b)))
-	if err != nil {
-		return LLMResponse{}, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	log.Printf("openai: POST %s model=%s messages=%d tools=%d bodyBytes=%d httpTimeout=%s maxRetries=%d", url, model, len(messages), len(tools), len(b), p.Client.Timeout, p.MaxRetries)
 
-	resp, err := p.Client.Do(req)
-	if err != nil {
-		return LLMResponse{}, err
+	var resp *http.Response
+	var lastErr error
+	for attempt := 1; attempt <= p.MaxRetries; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(string(b)))
+		if err != nil {
+			return LLMResponse{}, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+p.APIKey)
+
+		start := time.Now()
+		resp, err = p.Client.Do(req)
+		elapsed := time.Since(start)
+
+		if err != nil {
+			lastErr = err
+			log.Printf("openai: attempt %d/%d failed after %s: %v", attempt, p.MaxRetries, elapsed, err)
+			if ctx.Err() != nil {
+				return LLMResponse{}, fmt.Errorf("openai: context cancelled after %d attempts: %w", attempt, err)
+			}
+			backoff := time.Duration(attempt) * 2 * time.Second
+			log.Printf("openai: retrying in %s...", backoff)
+			time.Sleep(backoff)
+			continue
+		}
+
+		log.Printf("openai: attempt %d/%d response %s in %s", attempt, p.MaxRetries, resp.Status, elapsed)
+
+		if resp.StatusCode >= 500 || resp.StatusCode == 429 {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			lastErr = fmt.Errorf("OpenAI API error: %s - %s", resp.Status, strings.TrimSpace(string(bodyBytes)))
+			log.Printf("openai: attempt %d/%d got %s, retrying...", attempt, p.MaxRetries, resp.Status)
+			backoff := time.Duration(attempt) * 2 * time.Second
+			time.Sleep(backoff)
+			continue
+		}
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			body := strings.TrimSpace(string(bodyBytes))
+			log.Printf("OpenAI API non-2xx: %s body=%q", resp.Status, body)
+			if body == "" {
+				return LLMResponse{}, fmt.Errorf("OpenAI API error: %s", resp.Status)
+			}
+			return LLMResponse{}, fmt.Errorf("OpenAI API error: %s - %s", resp.Status, body)
+		}
+
+		// success
+		lastErr = nil
+		break
+	}
+	if lastErr != nil {
+		return LLMResponse{}, fmt.Errorf("openai: all %d attempts failed: %w", p.MaxRetries, lastErr)
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		// attempt to read response body for more details (do not expose API key)
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		body := strings.TrimSpace(string(bodyBytes))
-		log.Printf("OpenAI API non-2xx: %s body=%q", resp.Status, body)
-		if body == "" {
-			return LLMResponse{}, fmt.Errorf("OpenAI API error: %s", resp.Status)
-		}
-		return LLMResponse{}, fmt.Errorf("OpenAI API error: %s - %s", resp.Status, body)
-	}
 
 	var out chatResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {

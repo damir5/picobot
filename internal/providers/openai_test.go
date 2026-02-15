@@ -36,8 +36,7 @@ func TestOpenAIFunctionCallParsing(t *testing.T) {
 	}))
 	defer h.Close()
 
-	p := NewOpenAIProvider("test-key", h.URL)
-	p.Client = &http.Client{Timeout: 5 * time.Second}
+	p := NewOpenAIProvider("test-key", h.URL, 5*time.Second, 1)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

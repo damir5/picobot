@@ -1,6 +1,10 @@
 package providers
 
-import "github.com/local/picobot/internal/config"
+import (
+	"time"
+
+	"github.com/local/picobot/internal/config"
+)
 
 // NewProviderFromConfig creates a provider based on the configuration.
 // Simple rules (v0):
@@ -8,7 +12,8 @@ import "github.com/local/picobot/internal/config"
 //   - else fallback to stub
 func NewProviderFromConfig(cfg config.Config) LLMProvider {
 	if cfg.Providers.OpenAI != nil && cfg.Providers.OpenAI.APIKey != "" {
-		return NewOpenAIProvider(cfg.Providers.OpenAI.APIKey, cfg.Providers.OpenAI.APIBase)
+		timeout := time.Duration(cfg.Agents.Defaults.TimeoutS) * time.Second
+		return NewOpenAIProvider(cfg.Providers.OpenAI.APIKey, cfg.Providers.OpenAI.APIBase, timeout, cfg.Agents.Defaults.MaxRetries)
 	}
 	return NewStubProvider()
 }

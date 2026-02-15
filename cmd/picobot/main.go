@@ -67,12 +67,7 @@ func NewRootCmd() *cobra.Command {
 
 			hub := chat.NewHub(100)
 			cfg, _ := config.LoadConfig()
-			var provider providers.LLMProvider
-			if cfg.Providers.OpenAI != nil && cfg.Providers.OpenAI.APIKey != "" {
-				provider = providers.NewOpenAIProvider(cfg.Providers.OpenAI.APIKey, cfg.Providers.OpenAI.APIBase)
-			} else {
-				provider = providers.NewStubProvider()
-			}
+			provider := providers.NewProviderFromConfig(cfg)
 
 			// choose model: flag > config default > provider default
 			model := modelFlag
@@ -83,6 +78,17 @@ func NewRootCmd() *cobra.Command {
 				model = provider.GetDefaultModel()
 			}
 
+			timeout := time.Duration(cfg.Agents.Defaults.TimeoutS) * time.Second
+			if timeout <= 0 {
+				timeout = 120 * time.Second
+			}
+
+			apiBase := ""
+			if cfg.Providers.OpenAI != nil {
+				apiBase = cfg.Providers.OpenAI.APIBase
+			}
+			log.Printf("agent: provider=%T model=%s timeout=%s apiBase=%s", provider, model, timeout, apiBase)
+
 			// Create scheduler with persistence so agent can manage cron jobs.
 			// Nil callback is fine — jobs fire when the gateway runs.
 			persistPath := filepath.Join(cfg.Agents.Defaults.Workspace, "cron_jobs.yaml")
@@ -90,7 +96,7 @@ func NewRootCmd() *cobra.Command {
 
 			ag := agent.NewAgentLoop(hub, provider, model, 5, cfg.Agents.Defaults.Workspace, scheduler)
 
-			resp, err := ag.ProcessDirect(msg, 60*time.Second)
+			resp, err := ag.ProcessDirect(msg, timeout)
 			if err != nil {
 				fmt.Fprintln(cmd.ErrOrStderr(), "error:", err)
 				return
@@ -199,7 +205,11 @@ func NewRootCmd() *cobra.Command {
 			for _, job := range due {
 				log.Printf("tick: processing job %q: %s", job.Name, job.Message)
 				prompt := fmt.Sprintf("[Scheduled reminder fired] %s — Please relay this to the user in a friendly way.", job.Message)
-				resp, err := ag.ProcessDirect(prompt, 60*time.Second)
+				timeout := time.Duration(cfg.Agents.Defaults.TimeoutS) * time.Second
+			if timeout <= 0 {
+				timeout = 120 * time.Second
+			}
+			resp, err := ag.ProcessDirect(prompt, timeout)
 				if err != nil {
 					log.Printf("tick: error processing job %q: %v", job.Name, err)
 					continue
