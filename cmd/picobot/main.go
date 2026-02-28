@@ -108,6 +108,72 @@ func NewRootCmd() *cobra.Command {
 	agentCmd.Flags().StringP("model", "M", "", "Model to use (overrides config/provider default)")
 	rootCmd.AddCommand(agentCmd)
 
+	completeCmd := &cobra.Command{
+		Use:   "complete",
+		Short: "Run a single-shot provider completion without agent tools or workspace context",
+		Run: func(cmd *cobra.Command, args []string) {
+			msg, _ := cmd.Flags().GetString("message")
+			filePath, _ := cmd.Flags().GetString("file")
+			modelFlag, _ := cmd.Flags().GetString("model")
+
+			if msg == "" && filePath == "" {
+				fmt.Println("Specify a prompt with -m \"your prompt\" or -f <file>")
+				return
+			}
+			if msg != "" && filePath != "" {
+				fmt.Println("Use either -m or -f, not both")
+				return
+			}
+			if filePath != "" {
+				data, err := os.ReadFile(filePath)
+				if err != nil {
+					fmt.Fprintln(cmd.ErrOrStderr(), "error:", err)
+					return
+				}
+				msg = string(data)
+			}
+
+			cfg, _ := config.LoadConfig()
+			provider := providers.NewProviderFromConfig(cfg)
+
+			model := modelFlag
+			if model == "" && cfg.Agents.Defaults.Model != "" {
+				model = cfg.Agents.Defaults.Model
+			}
+			if model == "" {
+				model = provider.GetDefaultModel()
+			}
+
+			timeout := time.Duration(cfg.Agents.Defaults.TimeoutS) * time.Second
+			if timeout <= 0 {
+				timeout = 120 * time.Second
+			}
+
+			apiBase := ""
+			if cfg.Providers.OpenAI != nil {
+				apiBase = cfg.Providers.OpenAI.APIBase
+			}
+			log.Printf("complete: provider=%T model=%s timeout=%s apiBase=%s", provider, model, timeout, apiBase)
+
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+
+			resp, err := provider.Chat(ctx, []providers.Message{{
+				Role:    "user",
+				Content: msg,
+			}}, nil, model)
+			if err != nil {
+				fmt.Fprintln(cmd.ErrOrStderr(), "error:", err)
+				return
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), resp.Content)
+		},
+	}
+	completeCmd.Flags().StringP("message", "m", "", "Prompt to send to the provider")
+	completeCmd.Flags().StringP("file", "f", "", "Read prompt from file")
+	completeCmd.Flags().StringP("model", "M", "", "Model to use (overrides config/provider default)")
+	rootCmd.AddCommand(completeCmd)
+
 	gatewayCmd := &cobra.Command{
 		Use:   "gateway",
 		Short: "Start long-running gateway (agent, telegram, heartbeat)",
@@ -206,10 +272,10 @@ func NewRootCmd() *cobra.Command {
 				log.Printf("tick: processing job %q: %s", job.Name, job.Message)
 				prompt := fmt.Sprintf("[Scheduled reminder fired] %s — Please relay this to the user in a friendly way.", job.Message)
 				timeout := time.Duration(cfg.Agents.Defaults.TimeoutS) * time.Second
-			if timeout <= 0 {
-				timeout = 120 * time.Second
-			}
-			resp, err := ag.ProcessDirect(prompt, timeout)
+				if timeout <= 0 {
+					timeout = 120 * time.Second
+				}
+				resp, err := ag.ProcessDirect(prompt, timeout)
 				if err != nil {
 					log.Printf("tick: error processing job %q: %v", job.Name, err)
 					continue

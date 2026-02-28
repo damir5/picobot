@@ -61,7 +61,9 @@ func NewAgentLoop(b *chat.Hub, provider providers.LLMProvider, model string, max
 	}
 	reg.Register(fsTool)
 
-	reg.Register(tools.NewExecTool(60))
+	// Some workflows triggered via Telegram legitimately need longer than 60s
+	// (for example summarization pipelines that extract, synthesize, and render).
+	reg.Register(tools.NewExecTool(300))
 	reg.Register(tools.NewWebTool())
 	reg.Register(tools.NewSpawnTool())
 	reg.Register(tools.NewCronTool(scheduler, provider, model))
