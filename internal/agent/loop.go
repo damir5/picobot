@@ -2,9 +2,12 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -18,6 +21,7 @@ import (
 )
 
 var rememberRE = regexp.MustCompile(`(?i)^remember(?:\s+to)?\s+(.+)$`)
+var summarizeURLFastPathRE = regexp.MustCompile(`(?i)^\s*summar(?:ize|ise)\s+(https?://\S+)\s*$`)
 
 // AgentLoop is the core processing loop; it holds an LLM provider, tools, sessions and context builder.
 type AgentLoop struct {
@@ -30,6 +34,7 @@ type AgentLoop struct {
 	model         string
 	maxIterations int
 	running       bool
+	workspace     string
 }
 
 type messageSendTracker interface {
@@ -81,7 +86,7 @@ func NewAgentLoop(b *chat.Hub, provider providers.LLMProvider, model string, max
 	reg.Register(tools.NewReadSkillTool(skillMgr))
 	reg.Register(tools.NewDeleteSkillTool(skillMgr))
 
-	return &AgentLoop{hub: b, provider: provider, tools: reg, sessions: sm, context: ctx, memory: mem, model: model, maxIterations: maxIterations}
+	return &AgentLoop{hub: b, provider: provider, tools: reg, sessions: sm, context: ctx, memory: mem, model: model, maxIterations: maxIterations, workspace: workspace}
 }
 
 // Run starts processing inbound messages. This is a blocking call until context is canceled.
@@ -108,6 +113,25 @@ func (a *AgentLoop) Run(ctx context.Context) {
 			// store it in today's note and reply immediately without calling the LLM.
 			trimmed := strings.TrimSpace(msg.Content)
 			isScheduledReminder := strings.HasPrefix(trimmed, "[Scheduled reminder fired]")
+			if matches := summarizeURLFastPathRE.FindStringSubmatch(trimmed); len(matches) == 2 {
+				reply, err := a.runSummarizerFastPath(matches[1])
+				if err != nil {
+					reply = fmt.Sprintf("Summarizer failed: %v", err)
+				}
+
+				session := a.sessions.GetOrCreate(msg.Channel + ":" + msg.ChatID)
+				session.AddMessage("user", msg.Content)
+				session.AddMessage("assistant", reply)
+				a.sessions.Save(session)
+
+				out := chat.Outbound{Channel: msg.Channel, ChatID: msg.ChatID, Content: reply}
+				select {
+				case a.hub.Out <- out:
+				default:
+					log.Println("Outbound channel full, dropping message")
+				}
+				continue
+			}
 			rememberRe := rememberRE
 			if matches := rememberRe.FindStringSubmatch(trimmed); len(matches) == 2 {
 				note := matches[1]
@@ -221,6 +245,61 @@ func (a *AgentLoop) Run(ctx context.Context) {
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
+}
+
+type summarizeScriptResult struct {
+	Title        string `json:"title"`
+	ArtifactDir  string `json:"artifactDir"`
+	PublishedURL string `json:"publishedUrl"`
+	Gist         string `json:"gist"`
+	Status       string `json:"status"`
+}
+
+type summarizeArtifact struct {
+	Sections struct {
+		TLDR struct {
+			CoreTakeaway string `json:"coreTakeaway"`
+			Markdown     string `json:"markdown"`
+		} `json:"tldr"`
+	} `json:"sections"`
+}
+
+func (a *AgentLoop) runSummarizerFastPath(sourceURL string) (string, error) {
+	scriptPath := filepath.Clean(filepath.Join(a.workspace, "..", "..", "scripts", "summarize-source.ts"))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, scriptPath, "--source", sourceURL, "--no-publish", "--skip-audio")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+
+	var result summarizeScriptResult
+	if err := json.Unmarshal(out, &result); err != nil {
+		return "", fmt.Errorf("parse summarizer output: %w", err)
+	}
+	if result.ArtifactDir == "" {
+		return "", fmt.Errorf("summarizer returned no artifact directory")
+	}
+
+	data, err := os.ReadFile(filepath.Join(result.ArtifactDir, "summary.json"))
+	if err != nil {
+		return "", fmt.Errorf("read summary artifact: %w", err)
+	}
+	var artifact summarizeArtifact
+	if err := json.Unmarshal(data, &artifact); err != nil {
+		return "", fmt.Errorf("parse summary artifact: %w", err)
+	}
+
+	tldr := strings.TrimSpace(artifact.Sections.TLDR.Markdown)
+	if tldr == "" {
+		tldr = strings.TrimSpace(result.Gist)
+	}
+	if tldr == "" {
+		return "", fmt.Errorf("summary artifact missing TLDR")
+	}
+	return tldr, nil
 }
 
 // SetToolContext sets channel and chatID on tools that need routing context (message, cron).
