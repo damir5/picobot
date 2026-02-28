@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	"github.com/local/picobot/internal/chat"
 )
@@ -14,6 +15,8 @@ type MessageTool struct {
 	hub     *chat.Hub
 	channel string
 	chatID  string
+	mu      sync.Mutex
+	sent    int
 }
 
 func NewMessageTool(b *chat.Hub) *MessageTool {
@@ -38,8 +41,22 @@ func (m *MessageTool) Parameters() map[string]interface{} {
 
 // SetContext sets the current channel and chat id for outgoing messages.
 func (m *MessageTool) SetContext(channel, chatID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.channel = channel
 	m.chatID = chatID
+}
+
+func (m *MessageTool) ResetSendState() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sent = 0
+}
+
+func (m *MessageTool) SentCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.sent
 }
 
 // Expected args: {"content": "..."}
@@ -65,6 +82,9 @@ func (m *MessageTool) Execute(ctx context.Context, args map[string]interface{}) 
 	}
 	select {
 	case m.hub.Out <- out:
+		m.mu.Lock()
+		m.sent++
+		m.mu.Unlock()
 		return "sent", nil
 	default:
 		return "", fmt.Errorf("outbound channel full")

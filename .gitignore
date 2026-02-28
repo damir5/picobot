@@ -34,4 +34,5 @@ Thumbs.db
 
 # Misc
 *.log
-*.psdcron_jobs.yaml.lock
+*.psd
+cron_jobs.yaml.lock

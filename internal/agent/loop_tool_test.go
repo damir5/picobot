@@ -59,3 +59,40 @@ func TestAgentExecutesToolCall(t *testing.T) {
 		}
 	}
 }
+
+func TestScheduledReminderSuppressesFinalConfirmationAfterMessageTool(t *testing.T) {
+	b := chat.NewHub(10)
+	p := &FakeProvider{}
+	ag := NewAgentLoop(b, p, p.GetDefaultModel(), 3, "", nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go ag.Run(ctx)
+
+	in := chat.Inbound{
+		Channel:  "telegram",
+		SenderID: "cron",
+		ChatID:   "5616124731",
+		Content:  "[Scheduled reminder fired] Frisco tasks: Contact customer service, work on setup wizard, and webshop — Please relay this to the user in a friendly way.",
+	}
+	select {
+	case b.In <- in:
+	default:
+		t.Fatalf("couldn't send inbound")
+	}
+
+	select {
+	case out := <-b.Out:
+		if out.Content != "hello from tool" {
+			t.Fatalf("expected tool message outbound, got %q", out.Content)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("timeout waiting for tool outbound message")
+	}
+
+	select {
+	case out := <-b.Out:
+		t.Fatalf("expected no final confirmation outbound, got %q", out.Content)
+	case <-time.After(200 * time.Millisecond):
+	}
+}

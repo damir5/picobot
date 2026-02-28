@@ -32,6 +32,11 @@ type AgentLoop struct {
 	running       bool
 }
 
+type messageSendTracker interface {
+	ResetSendState()
+	SentCount() int
+}
+
 // NewAgentLoop creates a new AgentLoop with the given provider.
 func NewAgentLoop(b *chat.Hub, provider providers.LLMProvider, model string, maxIterations int, workspace string, scheduler *cron.Scheduler) *AgentLoop {
 	if model == "" {
@@ -100,6 +105,7 @@ func (a *AgentLoop) Run(ctx context.Context) {
 			// Quick heuristic: if user asks the agent to remember something explicitly,
 			// store it in today's note and reply immediately without calling the LLM.
 			trimmed := strings.TrimSpace(msg.Content)
+			isScheduledReminder := strings.HasPrefix(trimmed, "[Scheduled reminder fired]")
 			rememberRe := rememberRE
 			if matches := rememberRe.FindStringSubmatch(trimmed); len(matches) == 2 {
 				note := matches[1]
@@ -124,6 +130,9 @@ func (a *AgentLoop) Run(ctx context.Context) {
 			if mt := a.tools.Get("message"); mt != nil {
 				if mtool, ok := mt.(interface{ SetContext(string, string) }); ok {
 					mtool.SetContext(msg.Channel, msg.ChatID)
+				}
+				if tracker, ok := mt.(messageSendTracker); ok {
+					tracker.ResetSendState()
 				}
 			}
 			if ct := a.tools.Get("cron"); ct != nil {
@@ -179,10 +188,25 @@ func (a *AgentLoop) Run(ctx context.Context) {
 				finalContent = "I've completed processing but have no response to give."
 			}
 
+			suppressFinalOutbound := false
+			if mt := a.tools.Get("message"); mt != nil {
+				if tracker, ok := mt.(messageSendTracker); ok {
+					suppressFinalOutbound = isScheduledReminder && tracker.SentCount() > 0
+				}
+			}
+
 			// Save session
 			session.AddMessage("user", msg.Content)
-			session.AddMessage("assistant", finalContent)
+			if suppressFinalOutbound {
+				session.AddMessage("assistant", "(sent scheduled reminder)")
+			} else {
+				session.AddMessage("assistant", finalContent)
+			}
 			a.sessions.Save(session)
+
+			if suppressFinalOutbound {
+				continue
+			}
 
 			out := chat.Outbound{Channel: msg.Channel, ChatID: msg.ChatID, Content: finalContent}
 			select {
