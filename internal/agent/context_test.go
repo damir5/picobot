@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -37,5 +39,44 @@ func TestBuildMessagesIncludesMemories(t *testing.T) {
 	}
 	if !foundSummary {
 		t.Fatalf("expected memory summary to be present in messages: %v", msgs)
+	}
+}
+
+func TestBuildMessagesAddsSummarizerSkillInstructionForSummarizeURL(t *testing.T) {
+	t.Helper()
+
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "SOUL.md"), []byte("soul"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "AGENTS.md"), []byte("agents"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "USER.md"), []byte("user"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "TOOLS.md"), []byte("tools"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(workspace, "skills", "summarizer"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	skill := "---\nname: summarizer\ndescription: Summarize web pages\n---\n\nUse the summarizer workflow."
+	if err := os.WriteFile(filepath.Join(workspace, "skills", "summarizer", "SKILL.md"), []byte(skill), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cb := NewContextBuilder(workspace, memory.NewSimpleRanker(), 5)
+	msgs := cb.BuildMessages(nil, "summarize https://web4.ai/", "telegram", "123", "", nil)
+
+	found := false
+	for _, m := range msgs {
+		if m.Role == "system" && strings.Contains(m.Content, "matches the skill 'summarizer'") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected summarizer skill instruction in messages: %#v", msgs)
 	}
 }

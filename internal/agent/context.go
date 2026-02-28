@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/local/picobot/internal/agent/memory"
@@ -19,6 +20,8 @@ type ContextBuilder struct {
 	topK         int
 	skillsLoader *skills.Loader
 }
+
+var summarizeURLRE = regexp.MustCompile(`(?i)\bsummar(?:ize|ise|y|ise)\b.*https?://\S+`)
 
 func NewContextBuilder(workspace string, r memory.Ranker, topK int) *ContextBuilder {
 	return &ContextBuilder{
@@ -64,6 +67,10 @@ func (cb *ContextBuilder) BuildMessages(history []string, currentMessage string,
 			sb.WriteString(fmt.Sprintf("\n## %s\n%s\n\n%s\n", skill.Name, skill.Description, skill.Content))
 		}
 		msgs = append(msgs, providers.Message{Role: "system", Content: sb.String()})
+
+		if relevant := relevantSkillInstruction(currentMessage, loadedSkills); relevant != "" {
+			msgs = append(msgs, providers.Message{Role: "system", Content: relevant})
+		}
 	}
 
 	// include file-based memory context (long-term + today's notes) if present
@@ -96,4 +103,16 @@ func (cb *ContextBuilder) BuildMessages(history []string, currentMessage string,
 	// current
 	msgs = append(msgs, providers.Message{Role: "user", Content: currentMessage})
 	return msgs
+}
+
+func relevantSkillInstruction(currentMessage string, loadedSkills []skills.Skill) string {
+	lowerMessage := strings.ToLower(strings.TrimSpace(currentMessage))
+	if summarizeURLRE.MatchString(lowerMessage) {
+		for _, skill := range loadedSkills {
+			if strings.EqualFold(skill.Name, "summarizer") {
+				return "This request matches the skill 'summarizer'. Follow that skill's workflow exactly. Do not answer from memory, prior runs, or metadata alone when the user asked to summarize a URL."
+			}
+		}
+	}
+	return ""
 }
