@@ -94,7 +94,7 @@ func NewRootCmd() *cobra.Command {
 			persistPath := filepath.Join(cfg.Agents.Defaults.Workspace, "cron_jobs.yaml")
 			scheduler := cron.NewSchedulerWithPersistence(nil, persistPath)
 
-			ag := agent.NewAgentLoop(hub, provider, model, 5, cfg.Agents.Defaults.Workspace, scheduler)
+			ag := agent.NewAgentLoop(hub, provider, model, 50, cfg.Agents.Defaults.Workspace, scheduler)
 
 			resp, err := ag.ProcessDirect(msg, timeout)
 			if err != nil {
@@ -220,6 +220,70 @@ func NewRootCmd() *cobra.Command {
 	}
 	tickCmd.Flags().StringP("model", "M", "", "Model to use (overrides config/provider default)")
 	rootCmd.AddCommand(tickCmd)
+
+	fireCmd := &cobra.Command{
+		Use:   "fire <job-name>",
+		Short: "Force-fire a cron job by name with full gateway (Telegram, etc.)",
+		Args:  cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			jobName := args[0]
+			cfg, _ := config.LoadConfig()
+			provider := providers.NewProviderFromConfig(cfg)
+
+			modelFlag, _ := cmd.Flags().GetString("model")
+			model := modelFlag
+			if model == "" && cfg.Agents.Defaults.Model != "" {
+				model = cfg.Agents.Defaults.Model
+			}
+			if model == "" {
+				model = provider.GetDefaultModel()
+			}
+
+			persistPath := filepath.Join(cfg.Agents.Defaults.Workspace, "cron_jobs.yaml")
+			scheduler := cron.NewSchedulerWithPersistence(nil, persistPath)
+
+			// Find job by name
+			var target *cron.Job
+			for _, j := range scheduler.List() {
+				if j.Name == jobName {
+					jCopy := j
+					target = &jCopy
+					break
+				}
+			}
+			if target == nil {
+				fmt.Fprintf(os.Stderr, "job %q not found\n", jobName)
+				return
+			}
+
+			log.Printf("fire: forcing job %q: %s", target.Name, target.Message)
+
+			hub := chat.NewHub(200)
+			ag := agent.NewAgentLoop(hub, provider, model, 50, cfg.Agents.Defaults.Workspace, scheduler)
+
+			// Use send-only Telegram so the agent's message tool can deliver mid-workflow
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if cfg.Channels.Telegram.Enabled {
+				channels.StartTelegramSendOnly(ctx, hub, cfg.Channels.Telegram.Token)
+			}
+
+			// Set message tool context so it can send to the right Telegram chat
+			ag.SetToolContext(target.Channel, target.ChatID)
+
+			// ProcessDirect is synchronous — runs the full tool loop and returns when done
+			prompt := fmt.Sprintf("[Scheduled reminder fired] %s", target.Message)
+			timeout := 10 * time.Minute
+			resp, err := ag.ProcessDirect(prompt, timeout)
+			if err != nil {
+				fmt.Fprintln(cmd.ErrOrStderr(), "error:", err)
+				return
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), resp)
+		},
+	}
+	fireCmd.Flags().StringP("model", "M", "", "Model to use (overrides config/provider default)")
+	rootCmd.AddCommand(fireCmd)
 
 	// memory subcommands: read, append, write, recent
 	memoryCmd := &cobra.Command{

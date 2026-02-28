@@ -197,6 +197,20 @@ func (a *AgentLoop) Run(ctx context.Context) {
 	}
 }
 
+// SetToolContext sets channel and chatID on tools that need routing context (message, cron).
+func (a *AgentLoop) SetToolContext(channel, chatID string) {
+	if mt := a.tools.Get("message"); mt != nil {
+		if mtool, ok := mt.(interface{ SetContext(string, string) }); ok {
+			mtool.SetContext(channel, chatID)
+		}
+	}
+	if ct := a.tools.Get("cron"); ct != nil {
+		if ctool, ok := ct.(interface{ SetContext(string, string) }); ok {
+			ctool.SetContext(channel, chatID)
+		}
+	}
+}
+
 // ProcessDirect sends a message directly to the provider and returns the response.
 // It supports tool calling - if the model requests tools, they will be executed.
 func (a *AgentLoop) ProcessDirect(content string, timeout time.Duration) (string, error) {

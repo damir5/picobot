@@ -145,3 +145,33 @@ func StartTelegramWithBase(ctx context.Context, hub *chat.Hub, token, base strin
 
 	return nil
 }
+
+// StartTelegramSendOnly starts only the outbound sender goroutine (no polling).
+// Use this when another process is already polling the same bot token.
+func StartTelegramSendOnly(ctx context.Context, hub *chat.Hub, token string) {
+	base := "https://api.telegram.org/bot" + token
+	go func() {
+		client := &http.Client{Timeout: 10 * time.Second}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case out := <-hub.Out:
+				if out.Channel != "telegram" {
+					continue
+				}
+				u := base + "/sendMessage"
+				v := url.Values{}
+				v.Set("chat_id", out.ChatID)
+				v.Set("text", out.Content)
+				resp, err := client.PostForm(u, v)
+				if err != nil {
+					log.Printf("telegram sendMessage error: %v", err)
+					continue
+				}
+				io.ReadAll(resp.Body)
+				resp.Body.Close()
+			}
+		}
+	}()
+}
