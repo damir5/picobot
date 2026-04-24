@@ -68,7 +68,7 @@ func NewAgentLoop(b *chat.Hub, provider providers.LLMProvider, model string, max
 
 	// Some workflows triggered via Telegram legitimately need longer than 60s
 	// (for example summarization pipelines that extract, synthesize, and render).
-	reg.Register(tools.NewExecTool(300))
+	reg.Register(tools.NewExecToolWithWorkspace(300, execDirForWorkspace(workspace)))
 	reg.Register(tools.NewWebTool())
 	reg.Register(tools.NewSpawnTool())
 	reg.Register(tools.NewCronTool(scheduler, provider, model))
@@ -177,7 +177,7 @@ func (a *AgentLoop) Run(ctx context.Context) {
 			iteration := 0
 			finalContent := ""
 			lastToolResult := ""
-			toolDefs := a.tools.Definitions()
+			toolDefs := toolDefinitionsForMessage(a.tools.Definitions(), isScheduledReminder)
 			for iteration < a.maxIterations {
 				iteration++
 				log.Printf("agent: iteration %d/%d model=%s messages=%d tools=%d", iteration, a.maxIterations, a.model, len(messages), len(toolDefs))
@@ -193,6 +193,12 @@ func (a *AgentLoop) Run(ctx context.Context) {
 					messages = append(messages, providers.Message{Role: "assistant", Content: resp.Content, ToolCalls: resp.ToolCalls})
 					// Execute each tool call and return results with "tool" role
 					for _, tc := range resp.ToolCalls {
+						if !toolAllowedForMessage(tc.Name, isScheduledReminder) {
+							res := fmt.Sprintf("(tool error) tool %q is unavailable while processing a scheduled reminder", tc.Name)
+							lastToolResult = res
+							messages = append(messages, providers.Message{Role: "tool", Content: res, ToolCallID: tc.ID})
+							continue
+						}
 						res, err := a.tools.Execute(ctx, tc.Name, tc.Arguments)
 						if err != nil {
 							res = "(tool error) " + err.Error()
@@ -316,6 +322,35 @@ func (a *AgentLoop) SetToolContext(channel, chatID string) {
 	}
 }
 
+func toolDefinitionsForMessage(defs []providers.ToolDefinition, isScheduledReminder bool) []providers.ToolDefinition {
+	if !isScheduledReminder {
+		return defs
+	}
+
+	filtered := make([]providers.ToolDefinition, 0, len(defs))
+	for _, def := range defs {
+		if toolAllowedForMessage(def.Name, isScheduledReminder) {
+			filtered = append(filtered, def)
+		}
+	}
+	return filtered
+}
+
+func toolAllowedForMessage(name string, isScheduledReminder bool) bool {
+	if !isScheduledReminder {
+		return true
+	}
+	return name != "cron"
+}
+
+func execDirForWorkspace(workspace string) string {
+	clean := filepath.Clean(workspace)
+	if filepath.Base(clean) == "workspace" && filepath.Base(filepath.Dir(clean)) == ".picobot" {
+		return filepath.Dir(filepath.Dir(clean))
+	}
+	return clean
+}
+
 // ProcessDirect sends a message directly to the provider and returns the response.
 // It supports tool calling - if the model requests tools, they will be executed.
 func (a *AgentLoop) ProcessDirect(content string, timeout time.Duration) (string, error) {
@@ -326,9 +361,10 @@ func (a *AgentLoop) ProcessDirect(content string, timeout time.Duration) (string
 	memCtx, _ := a.memory.GetMemoryContext()
 	memories := a.memory.Recent(5)
 	messages := a.context.BuildMessages(nil, content, "cli", "direct", memCtx, memories)
+	isScheduledReminder := strings.HasPrefix(strings.TrimSpace(content), "[Scheduled reminder fired]")
 
 	// Support tool calling iterations (similar to main loop)
-	toolDefs := a.tools.Definitions()
+	toolDefs := toolDefinitionsForMessage(a.tools.Definitions(), isScheduledReminder)
 	var lastToolResult string
 	for iteration := 0; iteration < a.maxIterations; iteration++ {
 		log.Printf("direct: iteration %d/%d model=%s messages=%d tools=%d", iteration+1, a.maxIterations, a.model, len(messages), len(toolDefs))
@@ -352,6 +388,12 @@ func (a *AgentLoop) ProcessDirect(content string, timeout time.Duration) (string
 		// Execute tool calls
 		messages = append(messages, providers.Message{Role: "assistant", Content: resp.Content, ToolCalls: resp.ToolCalls})
 		for _, tc := range resp.ToolCalls {
+			if !toolAllowedForMessage(tc.Name, isScheduledReminder) {
+				result := fmt.Sprintf("(tool error) tool %q is unavailable while processing a scheduled reminder", tc.Name)
+				lastToolResult = result
+				messages = append(messages, providers.Message{Role: "tool", Content: result, ToolCallID: tc.ID})
+				continue
+			}
 			result, err := a.tools.Execute(ctx, tc.Name, tc.Arguments)
 			if err != nil {
 				result = "(tool error) " + err.Error()

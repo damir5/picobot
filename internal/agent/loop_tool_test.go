@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -27,6 +29,20 @@ func (f *FakeProvider) Chat(ctx context.Context, messages []providers.Message, t
 	return providers.LLMResponse{Content: "All done!"}, nil
 }
 func (f *FakeProvider) GetDefaultModel() string { return "fake" }
+
+type recordingProvider struct {
+	toolNames []string
+}
+
+func (p *recordingProvider) Chat(ctx context.Context, messages []providers.Message, tools []providers.ToolDefinition, model string) (providers.LLMResponse, error) {
+	p.toolNames = p.toolNames[:0]
+	for _, tool := range tools {
+		p.toolNames = append(p.toolNames, tool.Name)
+	}
+	return providers.LLMResponse{Content: "done"}, nil
+}
+
+func (p *recordingProvider) GetDefaultModel() string { return "fake" }
 
 func TestAgentExecutesToolCall(t *testing.T) {
 	b := chat.NewHub(10)
@@ -57,6 +73,76 @@ func TestAgentExecutesToolCall(t *testing.T) {
 		case <-deadline:
 			t.Fatalf("timeout waiting for final outbound message")
 		}
+	}
+}
+
+func TestScheduledReminderDoesNotExposeCronTool(t *testing.T) {
+	b := chat.NewHub(10)
+	p := &recordingProvider{}
+	ag := NewAgentLoop(b, p, p.GetDefaultModel(), 1, "", nil)
+
+	_, err := ag.ProcessDirect("[Scheduled reminder fired] reddit-daily-brief", time.Second)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	for _, name := range p.toolNames {
+		if name == "cron" {
+			t.Fatalf("scheduled reminder exposed cron tool: %v", p.toolNames)
+		}
+	}
+}
+
+func TestRegularMessageExposesCronTool(t *testing.T) {
+	b := chat.NewHub(10)
+	p := &recordingProvider{}
+	ag := NewAgentLoop(b, p, p.GetDefaultModel(), 1, "", nil)
+
+	_, err := ag.ProcessDirect("schedule a reminder", time.Second)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if !slices.Contains(p.toolNames, "cron") {
+		t.Fatalf("regular message did not expose cron tool: %v", p.toolNames)
+	}
+}
+
+func TestScheduledReminderRunPathDoesNotExposeCronTool(t *testing.T) {
+	b := chat.NewHub(10)
+	p := &recordingProvider{}
+	ag := NewAgentLoop(b, p, p.GetDefaultModel(), 1, "", nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go ag.Run(ctx)
+
+	b.In <- chat.Inbound{
+		Channel:  "telegram",
+		SenderID: "cron",
+		ChatID:   "5616124731",
+		Content:  "[Scheduled reminder fired] reddit-daily-brief — Please relay this to the user in a friendly way.",
+	}
+
+	select {
+	case <-b.Out:
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for outbound")
+	}
+
+	for _, name := range p.toolNames {
+		if name == "cron" {
+			t.Fatalf("scheduled reminder run path exposed cron tool: %v", p.toolNames)
+		}
+	}
+}
+
+func TestExecDirForPicobotWorkspaceUsesProjectRoot(t *testing.T) {
+	workspace := filepath.Join(string(filepath.Separator), "tmp", "assistant", ".picobot", "workspace")
+	want := filepath.Join(string(filepath.Separator), "tmp", "assistant")
+
+	if got := execDirForWorkspace(workspace); got != want {
+		t.Fatalf("execDirForWorkspace() = %q, want %q", got, want)
 	}
 }
 
