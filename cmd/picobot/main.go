@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -26,6 +28,8 @@ import (
 )
 
 const version = "0.1.0"
+
+const gatewayControlSocket = "picobot-gateway.sock"
 
 func NewRootCmd() *cobra.Command {
 	rootCmd := &cobra.Command{
@@ -195,7 +199,7 @@ func NewRootCmd() *cobra.Command {
 			// create scheduler with fire callback that routes back through the agent loop, so the LLM can process the reminder and respond naturally to the user.
 			// Use persistence to survive restarts.
 			persistPath := filepath.Join(cfg.Agents.Defaults.Workspace, "cron_jobs.yaml")
-			scheduler := cron.NewSchedulerWithPersistence(func(job cron.Job) {
+			dispatchCronJob := func(job cron.Job) {
 				log.Printf("cron fired: %s — %s", job.Name, job.Message)
 				hub.In <- chat.Inbound{
 					Channel:  job.Channel,
@@ -203,7 +207,8 @@ func NewRootCmd() *cobra.Command {
 					ChatID:   job.ChatID,
 					Content:  fmt.Sprintf("[Scheduled reminder fired] %s — Please relay this to the user in a friendly way.", job.Message),
 				}
-			}, persistPath)
+			}
+			scheduler := cron.NewSchedulerWithPersistence(dispatchCronJob, persistPath)
 
 			ag := agent.NewAgentLoop(hub, provider, model, 20, cfg.Agents.Defaults.Workspace, scheduler)
 			ctx, cancel := context.WithCancel(context.Background())
@@ -227,6 +232,10 @@ func NewRootCmd() *cobra.Command {
 				if err := channels.StartTelegram(ctx, hub, cfg.Channels.Telegram.Token, cfg.Channels.Telegram.AllowFrom); err != nil {
 					fmt.Fprintf(os.Stderr, "failed to start telegram: %v\n", err)
 				}
+			}
+
+			if err := startCronSignalServer(ctx, cfg.Agents.Defaults.Workspace, scheduler, dispatchCronJob); err != nil {
+				log.Printf("gateway: failed to start cron signal server: %v", err)
 			}
 
 			// wait for signal
@@ -350,6 +359,27 @@ func NewRootCmd() *cobra.Command {
 	}
 	fireCmd.Flags().StringP("model", "M", "", "Model to use (overrides config/provider default)")
 	rootCmd.AddCommand(fireCmd)
+
+	signalCronCmd := &cobra.Command{
+		Use:   "signal-cron <job-name>",
+		Short: "Ask the running gateway service to trigger a persisted cron job",
+		Args:  cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			jobName := args[0]
+			cfg, _ := config.LoadConfig()
+			workspace := cfg.Agents.Defaults.Workspace
+			if workspace == "" {
+				workspace = "~/.picobot/workspace"
+			}
+
+			if err := signalCronJobToGateway(workspace, jobName); err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "signal cron failed: %v\n", err)
+				return
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "signaled gateway to trigger cron job %q\n", jobName)
+		},
+	}
+	rootCmd.AddCommand(signalCronCmd)
 
 	// memory subcommands: read, append, write, recent
 	memoryCmd := &cobra.Command{
@@ -556,6 +586,144 @@ func NewRootCmd() *cobra.Command {
 
 	rootCmd.AddCommand(memoryCmd)
 	return rootCmd
+}
+
+func resolveWorkspacePath(workspace string) string {
+	if workspace == "" {
+		workspace = "~/.picobot/workspace"
+	}
+	home, _ := os.UserHomeDir()
+	if strings.HasPrefix(workspace, "~/") {
+		return filepath.Join(home, workspace[2:])
+	}
+	return workspace
+}
+
+func gatewayControlSocketPath(workspace string) string {
+	return filepath.Join(resolveWorkspacePath(workspace), gatewayControlSocket)
+}
+
+func startCronSignalServer(ctx context.Context, workspace string, scheduler *cron.Scheduler, dispatch func(cron.Job)) error {
+	path := gatewayControlSocketPath(workspace)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+
+	if _, err := os.Stat(path); err == nil {
+		conn, dialErr := net.DialTimeout("unix", path, 200*time.Millisecond)
+		if dialErr == nil {
+			conn.Close()
+			return fmt.Errorf("control socket already in use: %s", path)
+		}
+		if err := os.Remove(path); err != nil {
+			return fmt.Errorf("remove stale control socket: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		return err
+	}
+
+	go func() {
+		<-ctx.Done()
+		listener.Close()
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			log.Printf("gateway: failed to remove control socket: %v", err)
+		}
+	}()
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					log.Printf("gateway: cron signal accept failed: %v", err)
+					continue
+				}
+			}
+			go handleCronSignalConnection(conn, scheduler, dispatch)
+		}
+	}()
+
+	return nil
+}
+
+func handleCronSignalConnection(conn net.Conn, scheduler *cron.Scheduler, dispatch func(cron.Job)) {
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+	data, err := io.ReadAll(conn)
+	if err != nil {
+		fmt.Fprintf(conn, "error: read request: %v\n", err)
+		return
+	}
+	jobName := strings.TrimSpace(string(data))
+	if jobName == "" {
+		fmt.Fprintln(conn, "error: missing job name")
+		return
+	}
+
+	job, ok := findCronJobByName(scheduler, jobName)
+	if !ok {
+		fmt.Fprintf(conn, "error: job %q not found in running gateway\n", jobName)
+		return
+	}
+
+	log.Printf("gateway: cron signal triggering job %q", jobName)
+	dispatch(job)
+	fmt.Fprintf(conn, "ok: triggered %q\n", jobName)
+}
+
+func signalCronJobToGateway(workspace, jobName string) error {
+	jobName = strings.TrimSpace(jobName)
+	if jobName == "" {
+		return fmt.Errorf("missing job name")
+	}
+
+	path := gatewayControlSocketPath(workspace)
+	conn, err := net.DialTimeout("unix", path, 5*time.Second)
+	if err != nil {
+		return fmt.Errorf("connect to running gateway at %s: %w", path, err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+
+	if _, err := io.WriteString(conn, jobName+"\n"); err != nil {
+		return fmt.Errorf("write request: %w", err)
+	}
+	if unixConn, ok := conn.(*net.UnixConn); ok {
+		if err := unixConn.CloseWrite(); err != nil {
+			return fmt.Errorf("close request: %w", err)
+		}
+	}
+
+	resp, err := io.ReadAll(conn)
+	if err != nil {
+		return fmt.Errorf("read response: %w", err)
+	}
+	reply := strings.TrimSpace(string(resp))
+	if strings.HasPrefix(reply, "error:") {
+		return fmt.Errorf("%s", strings.TrimSpace(strings.TrimPrefix(reply, "error:")))
+	}
+	if !strings.HasPrefix(reply, "ok:") {
+		return fmt.Errorf("unexpected gateway response %q", reply)
+	}
+	return nil
+}
+
+func findCronJobByName(scheduler *cron.Scheduler, jobName string) (cron.Job, bool) {
+	for _, job := range scheduler.List() {
+		if job.Name == jobName {
+			return job, true
+		}
+	}
+	return cron.Job{}, false
 }
 
 func main() {

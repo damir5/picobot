@@ -2,13 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/local/picobot/internal/agent/memory"
 	"github.com/local/picobot/internal/config"
+	"github.com/local/picobot/internal/cron"
 )
 
 func TestMemoryCLI_ReadAppendWriteRecent(t *testing.T) {
@@ -147,4 +150,122 @@ func TestAgentCLI_ModelFlag(t *testing.T) {
 	if !strings.Contains(out, "(stub) Echo") {
 		t.Fatalf("expected stub echo output, got: %q", out)
 	}
+}
+
+func TestSignalCronJobToGatewayDispatchesLiveSchedulerJob(t *testing.T) {
+	workspace := shortTempDir(t)
+
+	dispatched := make(chan cron.Job, 1)
+	scheduler := cron.NewScheduler(nil)
+	scheduler.Add("slack-daily-brief", "slack-daily-brief", time.Hour, "telegram", "1")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := startCronSignalServer(ctx, workspace, scheduler, func(job cron.Job) {
+		dispatched <- job
+	}); err != nil {
+		t.Fatalf("startCronSignalServer failed: %v", err)
+	}
+
+	if err := signalCronJobToGateway(workspace, "slack-daily-brief"); err != nil {
+		t.Fatalf("signalCronJobToGateway failed: %v", err)
+	}
+
+	select {
+	case job := <-dispatched:
+		if job.Name != "slack-daily-brief" {
+			t.Fatalf("dispatched job %q, want slack-daily-brief", job.Name)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for dispatched cron job")
+	}
+}
+
+func TestSignalCronCommandUsesRunningGatewayState(t *testing.T) {
+	tmp := shortTempDir(t)
+	os.Setenv("HOME", tmp)
+	if _, _, err := config.Onboard(); err != nil {
+		t.Fatalf("onboard failed: %v", err)
+	}
+
+	cfg, _ := config.LoadConfig()
+	ws := cfg.Agents.Defaults.Workspace
+	dispatched := make(chan cron.Job, 1)
+	scheduler := cron.NewScheduler(nil)
+	scheduler.Add("discord-daily-brief", "discord-daily-brief", time.Hour, "telegram", "1")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := startCronSignalServer(ctx, ws, scheduler, func(job cron.Job) {
+		dispatched <- job
+	}); err != nil {
+		t.Fatalf("startCronSignalServer failed: %v", err)
+	}
+
+	cmd := NewRootCmd()
+	outBuf := &bytes.Buffer{}
+	errBuf := &bytes.Buffer{}
+	cmd.SetOut(outBuf)
+	cmd.SetErr(errBuf)
+	cmd.SetArgs([]string{"signal-cron", "discord-daily-brief"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("signal-cron returned cobra error: %v", err)
+	}
+
+	if errBuf.String() != "" {
+		t.Fatalf("expected no stderr, got %q", errBuf.String())
+	}
+	if !strings.Contains(outBuf.String(), "signaled gateway to trigger cron job \"discord-daily-brief\"") {
+		t.Fatalf("unexpected stdout: %q", outBuf.String())
+	}
+
+	select {
+	case job := <-dispatched:
+		if job.Name != "discord-daily-brief" {
+			t.Fatalf("dispatched job %q, want discord-daily-brief", job.Name)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for dispatched cron job")
+	}
+}
+
+func TestSignalCronCommandReportsMissingLiveJob(t *testing.T) {
+	tmp := shortTempDir(t)
+	os.Setenv("HOME", tmp)
+	if _, _, err := config.Onboard(); err != nil {
+		t.Fatalf("onboard failed: %v", err)
+	}
+
+	cfg, _ := config.LoadConfig()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := startCronSignalServer(ctx, cfg.Agents.Defaults.Workspace, cron.NewScheduler(nil), func(job cron.Job) {}); err != nil {
+		t.Fatalf("startCronSignalServer failed: %v", err)
+	}
+
+	cmd := NewRootCmd()
+	errBuf := &bytes.Buffer{}
+	cmd.SetErr(errBuf)
+	cmd.SetArgs([]string{"signal-cron", "slack-daily-brief"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("signal-cron returned cobra error: %v", err)
+	}
+
+	if !strings.Contains(errBuf.String(), "job \"slack-daily-brief\" not found in running gateway") {
+		t.Fatalf("expected missing live job error, got %q", errBuf.String())
+	}
+}
+
+func shortTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "pico-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Fatalf("remove temp dir %s: %v", dir, err)
+		}
+	})
+	return dir
 }

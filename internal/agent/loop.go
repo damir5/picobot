@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/local/picobot/internal/agent/memory"
 	"github.com/local/picobot/internal/agent/tools"
@@ -22,6 +25,11 @@ import (
 
 var rememberRE = regexp.MustCompile(`(?i)^remember(?:\s+to)?\s+(.+)$`)
 var summarizeURLFastPathRE = regexp.MustCompile(`(?i)^\s*summar(?:ize|ise)\s+(https?://\S+)\s*$`)
+
+const (
+	slackDailyBriefTrigger   = "slack-daily-brief"
+	discordDailyBriefTrigger = "discord-daily-brief"
+)
 
 // AgentLoop is the core processing loop; it holds an LLM provider, tools, sessions and context builder.
 type AgentLoop struct {
@@ -113,6 +121,16 @@ func (a *AgentLoop) Run(ctx context.Context) {
 			// store it in today's note and reply immediately without calling the LLM.
 			trimmed := strings.TrimSpace(msg.Content)
 			isScheduledReminder := strings.HasPrefix(trimmed, "[Scheduled reminder fired]")
+			if trigger, ok := scheduledBriefTrigger(trimmed); ok {
+				reply, err := a.runScheduledBriefFastPath(ctx, trigger)
+				if err != nil {
+					reply = fmt.Sprintf("%s failed: %v", scheduledBriefLabel(trigger), err)
+				}
+
+				a.saveAndSendReply(msg, reply)
+				continue
+			}
+
 			if matches := summarizeURLFastPathRE.FindStringSubmatch(trimmed); len(matches) == 2 {
 				reply, err := a.runSummarizerFastPath(matches[1])
 				if err != nil {
@@ -308,6 +326,188 @@ func (a *AgentLoop) runSummarizerFastPath(sourceURL string) (string, error) {
 	return tldr, nil
 }
 
+type briefScriptResult struct {
+	Status       string   `json:"status"`
+	Date         string   `json:"date"`
+	MarkdownPath string   `json:"markdownPath"`
+	HTMLPath     string   `json:"htmlPath"`
+	URL          string   `json:"url"`
+	Summary      []string `json:"summary"`
+	Error        string   `json:"error"`
+}
+
+func scheduledBriefTrigger(content string) (string, bool) {
+	trimmed := strings.TrimSpace(content)
+	if hasBriefTriggerPrefix(trimmed, slackDailyBriefTrigger) {
+		return slackDailyBriefTrigger, true
+	}
+	if hasBriefTriggerPrefix(trimmed, discordDailyBriefTrigger) {
+		return discordDailyBriefTrigger, true
+	}
+	if !strings.HasPrefix(trimmed, "[Scheduled reminder fired]") {
+		return "", false
+	}
+
+	reminder := strings.TrimSpace(strings.TrimPrefix(trimmed, "[Scheduled reminder fired]"))
+	switch {
+	case hasBriefTriggerPrefix(reminder, slackDailyBriefTrigger):
+		return slackDailyBriefTrigger, true
+	case hasBriefTriggerPrefix(reminder, discordDailyBriefTrigger):
+		return discordDailyBriefTrigger, true
+	default:
+		return "", false
+	}
+}
+
+func hasBriefTriggerPrefix(content, trigger string) bool {
+	if content == trigger {
+		return true
+	}
+	if !strings.HasPrefix(content, trigger) {
+		return false
+	}
+	rest := strings.TrimPrefix(content, trigger)
+	if rest == "" {
+		return true
+	}
+	r, _ := utf8.DecodeRuneInString(rest)
+	return unicode.IsSpace(r) || r == ':' || r == '—' || r == '–'
+}
+
+func scheduledBriefLabel(trigger string) string {
+	switch trigger {
+	case slackDailyBriefTrigger:
+		return "Slack daily brief"
+	case discordDailyBriefTrigger:
+		return "Discord daily brief"
+	default:
+		return "Daily brief"
+	}
+}
+
+func scheduledBriefScript(trigger string) (string, bool) {
+	switch trigger {
+	case slackDailyBriefTrigger:
+		return "slack-daily-brief.ts", true
+	case discordDailyBriefTrigger:
+		return "discord-daily-brief.ts", true
+	default:
+		return "", false
+	}
+}
+
+func (a *AgentLoop) runScheduledBriefFastPath(parent context.Context, trigger string) (string, error) {
+	scriptName, ok := scheduledBriefScript(trigger)
+	if !ok {
+		return "", fmt.Errorf("unsupported scheduled brief trigger %q", trigger)
+	}
+
+	scriptPath := filepath.Clean(filepath.Join(a.workspace, "..", "..", "scripts", scriptName))
+	ctx, cancel := context.WithTimeout(parent, 5*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, scriptPath)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	result, parseErr := parseBriefScriptResult(stdout.Bytes())
+	if parseErr == nil {
+		if err != nil && result.Status == "" {
+			result.Status = "failed"
+		}
+		if err != nil && result.Error == "" {
+			result.Error = strings.TrimSpace(stderr.String())
+			if result.Error == "" {
+				result.Error = err.Error()
+			}
+		}
+		return formatBriefScriptResult(scheduledBriefLabel(trigger), result), nil
+	}
+	if err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = strings.TrimSpace(stdout.String())
+		}
+		if msg == "" {
+			msg = err.Error()
+		}
+		return "", fmt.Errorf("%v: %s", err, msg)
+	}
+	return "", fmt.Errorf("parse helper output: %w", parseErr)
+}
+
+func parseBriefScriptResult(output []byte) (briefScriptResult, error) {
+	var result briefScriptResult
+	if err := json.Unmarshal(bytes.TrimSpace(output), &result); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+func formatBriefScriptResult(label string, result briefScriptResult) string {
+	status := strings.TrimSpace(result.Status)
+	if status == "" {
+		status = "completed"
+	}
+
+	date := strings.TrimSpace(result.Date)
+	if date == "" {
+		date = "requested date"
+	}
+
+	var b strings.Builder
+	switch status {
+	case "published":
+		fmt.Fprintf(&b, "%s published for %s.", label, date)
+	case "rendered":
+		fmt.Fprintf(&b, "%s rendered for %s.", label, date)
+	case "failed":
+		fmt.Fprintf(&b, "%s failed for %s.", label, date)
+	default:
+		fmt.Fprintf(&b, "%s %s for %s.", label, status, date)
+	}
+
+	if result.URL != "" {
+		fmt.Fprintf(&b, "\n\nURL: %s", result.URL)
+	}
+	if result.Error != "" {
+		fmt.Fprintf(&b, "\n\nError: %s", result.Error)
+	}
+	if len(result.Summary) > 0 {
+		b.WriteString("\n\nSummary:")
+		for _, line := range result.Summary {
+			line = strings.TrimSpace(line)
+			if line != "" {
+				fmt.Fprintf(&b, "\n%s", line)
+			}
+		}
+	}
+	if result.MarkdownPath != "" {
+		fmt.Fprintf(&b, "\n\nMarkdown: %s", result.MarkdownPath)
+	}
+	if result.HTMLPath != "" {
+		fmt.Fprintf(&b, "\nHTML: %s", result.HTMLPath)
+	}
+	return b.String()
+}
+
+func (a *AgentLoop) saveAndSendReply(msg chat.Inbound, reply string) {
+	session := a.sessions.GetOrCreate(msg.Channel + ":" + msg.ChatID)
+	session.AddMessage("user", msg.Content)
+	session.AddMessage("assistant", reply)
+	a.sessions.Save(session)
+
+	out := chat.Outbound{Channel: msg.Channel, ChatID: msg.ChatID, Content: reply}
+	select {
+	case a.hub.Out <- out:
+	default:
+		log.Println("Outbound channel full, dropping message")
+	}
+}
+
 // SetToolContext sets channel and chatID on tools that need routing context (message, cron).
 func (a *AgentLoop) SetToolContext(channel, chatID string) {
 	if mt := a.tools.Get("message"); mt != nil {
@@ -356,6 +556,10 @@ func execDirForWorkspace(workspace string) string {
 func (a *AgentLoop) ProcessDirect(content string, timeout time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+
+	if trigger, ok := scheduledBriefTrigger(content); ok {
+		return a.runScheduledBriefFastPath(ctx, trigger)
+	}
 
 	// Build full context (bootstrap files, skills, memory) just like the main loop
 	memCtx, _ := a.memory.GetMemoryContext()
